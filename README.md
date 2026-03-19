@@ -1,17 +1,41 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Biashara AI
 
-# Run and deploy your AI Studio app
+**Biashara AI** is an AI-powered backend platform that automatically parses business transactions from text messages, stores them in a database, and provides a webhook API for integration with frontend apps or chat platforms.
 
-This contains everything you need to run your app locally.
+The backend uses **Node.js**, **Express**, **OpenAI API** for AI parsing, and **Supabase** for database storage.
 
-View your app in AI Studio: https://ai.studio/apps/bb4643ea-52e2-4851-bb8e-ca3d23b27b87
+---
 
-## Run Locally
+## Features
 
-**Prerequisites:**  Node.js
+- AI-powered parsing of transaction messages
+- Supports sale and expense detection
+- Stores transactions in Supabase
+- Webhook API to integrate with frontend apps or messaging platforms
+- Environment-based configuration for API keys and database
 
+---
+
+## Project Structure
+
+```text
+biashara-ai/
+├── README.md
+├── package.json
+├── .env
+└── src/
+    ├── config/
+    │   └── db.js
+    ├── controllers/
+    │   └── transactionController.js
+    ├── routes/
+    │   └── webhook.js
+    ├── server.js
+    ├── services/
+    │   ├── aiService.js
+    │   └── dbService.js
+    └── utils/
+        └── parser.js
 
 1. Install dependencies:
    `npm install`
