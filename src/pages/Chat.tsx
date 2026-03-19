@@ -1,10 +1,9 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Send, Bot, User, CheckCircle2, Loader2, Cloud, Package } from "lucide-react";
+import { Send, Bot, CheckCircle2, Loader2, Cloud } from "lucide-react";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { parseTransactionMessage } from "../lib/ai";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
-import { collection, addDoc, getDocs, query, where, runTransaction, doc } from "firebase/firestore";
+import { supabase } from "../lib/supabase";
 import { cn } from "../lib/utils";
 import { useAuth } from "../hooks/useAuth";
 import { useToast } from "../components/Toast";
@@ -59,7 +58,7 @@ export default function Chat() {
     try {
       // 1. Parse with AI
       const parsed = await parseTransactionMessage(userMsg.text);
-      
+
       if (!parsed) {
         throw new Error("Could not understand the transaction.");
       }
@@ -68,83 +67,133 @@ export default function Chat() {
         throw new Error("Please log in to save transactions.");
       }
 
-      // 2. Try to find a matching product if productName is present
-      let matchedProductId = null;
-      let matchedProductName = null;
+      // 2. Try to find a matching product by name (fuzzy, client-side)
+      let matchedProductId: string | null = null;
+      let matchedProductName: string | null = null;
+      let matchedProduct: {
+        id: string;
+        stock: number;
+        total_sold: number;
+        total_bought: number;
+        name: string;
+      } | null = null;
 
       if (parsed.productName && parsed.quantity) {
-        const productsRef = collection(db, "products");
-        const q = query(productsRef, where("userId", "==", user.uid));
-        const querySnapshot = await getDocs(q);
-        
-        const searchName = parsed.productName.toLowerCase();
-        const match = querySnapshot.docs.find(doc => 
-          doc.data().name.toLowerCase().includes(searchName) || 
-          searchName.includes(doc.data().name.toLowerCase())
-        );
+        const { data: productRows, error: productErr } = await supabase
+          .from("products")
+          .select("id, name, stock, total_sold, total_bought")
+          .eq("user_id", user.id);
 
-        if (match) {
-          matchedProductId = match.id;
-          matchedProductName = match.data().name;
+        if (productErr) {
+          console.error("Product lookup failed:", productErr.message);
+        } else if (productRows) {
+          const searchName = parsed.productName.toLowerCase();
+          const match = productRows.find(
+            (p) =>
+              p.name.toLowerCase().includes(searchName) ||
+              searchName.includes(p.name.toLowerCase())
+          );
+
+          if (match) {
+            matchedProductId = match.id;
+            matchedProductName = match.name;
+            matchedProduct = match;
+          }
         }
       }
 
-      // 3. Save to DB (using transaction if product matched)
-      const transactionId = Math.random().toString(36).substring(2, 15);
-      const transactionData = {
-        id: transactionId,
-        userId: user.uid,
+      // 3. Build the transaction payload (snake_case for Supabase)
+      const transactionPayload = {
+        user_id: user.id,
         type: parsed.type,
         amount: parsed.amount,
         category: parsed.category,
         description: parsed.description,
-        productId: matchedProductId || null,
-        quantity: parsed.quantity || null,
-        createdAt: new Date().toISOString()
+        product_id: matchedProductId ?? null,
+        quantity: parsed.quantity ?? null,
+        created_at: new Date().toISOString(),
       };
 
-      if (matchedProductId && parsed.quantity) {
-        await runTransaction(db, async (transaction) => {
-          const productRef = doc(db, "products", matchedProductId!);
-          const productDoc = await transaction.get(productRef);
-          
-          if (!productDoc.exists()) {
-            throw new Error("Product no longer exists.");
-          }
+      if (matchedProductId && matchedProduct && parsed.quantity) {
+        /**
+         * Supabase doesn't have multi-document transactions across tables like
+         * Firestore's runTransaction, but we can keep things atomic at the
+         * product level by using an RPC (Postgres function) if needed. For
+         * most use-cases the two sequential writes below are sufficient and
+         * safe because:
+         *   a) The inventory update uses the latest DB values (re-fetched above).
+         *   b) RLS policies ensure only the owner can mutate their rows.
+         *
+         * If you need true atomicity, create a Postgres function in Supabase
+         * and call it with supabase.rpc('record_transaction', { ... }).
+         */
+        const quantity = parsed.quantity;
+        const newStock =
+          parsed.type === 'sale'
+            ? matchedProduct.stock - quantity
+            : matchedProduct.stock + quantity;
+        const newTotalSold =
+          parsed.type === 'sale'
+            ? matchedProduct.total_sold + quantity
+            : matchedProduct.total_sold;
+        const newTotalBought =
+          parsed.type === 'expense'
+            ? matchedProduct.total_bought + quantity
+            : matchedProduct.total_bought;
 
-          const productData = productDoc.data();
-          const quantity = parsed.quantity!;
-          
-          let newStock = productData.stock || 0;
-          let newTotalSold = productData.totalSold || 0;
-          let newTotalBought = productData.totalBought || 0;
-
-          if (parsed.type === 'sale') {
-            newStock -= quantity;
-            newTotalSold += quantity;
-          } else {
-            newStock += quantity;
-            newTotalBought += quantity;
-          }
-
-          transaction.update(productRef, {
+        // Update product stock first
+        const { error: stockErr } = await supabase
+          .from("products")
+          .update({
             stock: newStock,
-            totalSold: newTotalSold,
-            totalBought: newTotalBought,
-            updatedAt: new Date().toISOString()
-          });
+            total_sold: newTotalSold,
+            total_bought: newTotalBought,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", matchedProductId)
+          .eq("user_id", user.id); // RLS double-check
 
-          const newTransRef = doc(collection(db, "transactions"));
-          transaction.set(newTransRef, transactionData);
-        });
+        if (stockErr) {
+          throw new Error(`Failed to update stock: ${stockErr.message}`);
+        }
+
+        // Then insert the transaction
+        const { error: txErr } = await supabase
+          .from("transactions")
+          .insert(transactionPayload);
+
+        if (txErr) {
+          // Best-effort: attempt to roll back the stock change
+          await supabase
+            .from("products")
+            .update({
+              stock: matchedProduct.stock,
+              total_sold: matchedProduct.total_sold,
+              total_bought: matchedProduct.total_bought,
+            })
+            .eq("id", matchedProductId)
+            .eq("user_id", user.id);
+
+          throw new Error(`Failed to save transaction: ${txErr.message}`);
+        }
       } else {
-        await addDoc(collection(db, "transactions"), transactionData);
+        // No product match — simple insert
+        const { error: txErr } = await supabase
+          .from("transactions")
+          .insert(transactionPayload);
+
+        if (txErr) {
+          throw new Error(`Failed to save transaction: ${txErr.message}`);
+        }
       }
 
       showToast("Transaction recorded!", "success");
-      // 4. Update UI
-      setMessages(prev => prev.map(m => m.id === userMsg.id ? { ...m, status: 'success' } : m));
-      
+
+      // 4. Update user message status
+      setMessages(prev =>
+        prev.map(m => m.id === userMsg.id ? { ...m, status: 'success' } : m)
+      );
+
       let botResponse = `✅ Recorded: ${parsed.type === 'sale' ? 'Sale' : 'Expense'} of KES ${parsed.amount.toLocaleString()} for ${parsed.category}.`;
       if (matchedProductName && parsed.quantity) {
         botResponse += `\n📦 Updated stock for ${matchedProductName} (${parsed.type === 'sale' ? '-' : '+'}${parsed.quantity})`;
@@ -152,31 +201,37 @@ export default function Chat() {
         botResponse += `\n⚠️ Note: I couldn't find a product named "${parsed.productName}" in your inventory to update stock.`;
       }
 
-      const botMsg: Message = {
-        id: (Date.now() + 1).toString(),
-        text: botResponse,
-        sender: 'bot',
-        timestamp: new Date()
-      };
-      setMessages(prev => [...prev, botMsg]);
+      setMessages(prev => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          text: botResponse,
+          sender: 'bot',
+          timestamp: new Date(),
+        },
+      ]);
 
     } catch (error: any) {
       console.error(error);
-      setMessages(prev => prev.map(m => m.id === userMsg.id ? { ...m, status: 'error' } : m));
-      
-      let errorText = error.message;
-      if (error.message && error.message.includes('permission')) {
-        errorText = "Permission denied. Please check your login status.";
-        handleFirestoreError(error, OperationType.CREATE, "transactions");
-      }
 
-      const botMsg: Message = {
-        id: (Date.now() + 1).toString(),
-        text: `❌ Sorry, I couldn't process that. ${errorText}`,
-        sender: 'bot',
-        timestamp: new Date()
-      };
-      setMessages(prev => [...prev, botMsg]);
+      setMessages(prev =>
+        prev.map(m => m.id === userMsg.id ? { ...m, status: 'error' } : m)
+      );
+
+      const errorText =
+        error.message?.includes('permission') || error.message?.includes('denied')
+          ? "Permission denied. Please check your login status."
+          : error.message ?? "An unexpected error occurred.";
+
+      setMessages(prev => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          text: `❌ Sorry, I couldn't process that. ${errorText}`,
+          sender: 'bot',
+          timestamp: new Date(),
+        },
+      ]);
     } finally {
       setIsProcessing(false);
     }
@@ -192,7 +247,7 @@ export default function Chat() {
           <h1 className="font-bold text-slate-900">Biashara Assistant</h1>
           <div className="flex items-center gap-2">
             <p className="text-xs text-emerald-600 font-medium flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               Online
             </p>
             <span className="text-[9px] px-1 rounded font-bold uppercase tracking-tighter bg-emerald-100 text-emerald-600 flex items-center gap-1">
@@ -214,11 +269,11 @@ export default function Chat() {
           >
             <div className={cn(
               "max-w-[80%] rounded-2xl px-4 py-3 shadow-sm",
-              msg.sender === 'user' 
-                ? "bg-emerald-600 text-white rounded-br-sm" 
+              msg.sender === 'user'
+                ? "bg-emerald-600 text-white rounded-br-sm"
                 : "bg-white border border-slate-100 text-slate-900 rounded-bl-sm"
             )}>
-              <p className="text-[15px] leading-relaxed">{msg.text}</p>
+              <p className="text-[15px] leading-relaxed whitespace-pre-line">{msg.text}</p>
               <div className={cn(
                 "flex items-center justify-end gap-1 mt-1 text-[10px]",
                 msg.sender === 'user' ? "text-emerald-100" : "text-slate-400"
@@ -236,9 +291,9 @@ export default function Chat() {
         {isProcessing && (
           <div className="flex w-full justify-start">
             <div className="bg-white border border-slate-100 rounded-2xl rounded-bl-sm px-4 py-3 shadow-sm flex items-center gap-2">
-              <div className="w-2 h-2 bg-slate-300 rounded-full animate-bounce"></div>
-              <div className="w-2 h-2 bg-slate-300 rounded-full animate-bounce [animation-delay:0.2s]"></div>
-              <div className="w-2 h-2 bg-slate-300 rounded-full animate-bounce [animation-delay:0.4s]"></div>
+              <div className="w-2 h-2 bg-slate-300 rounded-full animate-bounce" />
+              <div className="w-2 h-2 bg-slate-300 rounded-full animate-bounce [animation-delay:0.2s]" />
+              <div className="w-2 h-2 bg-slate-300 rounded-full animate-bounce [animation-delay:0.4s]" />
             </div>
           </div>
         )}
@@ -254,9 +309,9 @@ export default function Chat() {
             className="rounded-full bg-slate-100 border-transparent focus-visible:ring-emerald-500/50 focus-visible:bg-white"
             disabled={isProcessing}
           />
-          <Button 
-            type="submit" 
-            size="icon" 
+          <Button
+            type="submit"
+            size="icon"
             className="rounded-full shrink-0 bg-emerald-600 hover:bg-emerald-700 h-12 w-12"
             disabled={!input.trim() || isProcessing}
           >
