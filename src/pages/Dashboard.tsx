@@ -1,8 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { ArrowDownRight, ArrowUpRight, TrendingUp, Wallet, BarChart3, Download, RefreshCw, Cloud } from "lucide-react";
-import { db, auth, handleFirestoreError, OperationType } from "../lib/firebase";
-import { collection, query, where, orderBy, onSnapshot, limit } from "firebase/firestore";
+import { supabase } from "../lib/supabase";
 import { 
   format, 
   isSameDay, 
@@ -19,11 +18,6 @@ import {
   startOfYear,
   eachHourOfInterval,
   startOfHour,
-  subHours,
-  addDays,
-  addWeeks,
-  addMonths,
-  addYears,
   eachDayOfInterval,
   eachWeekOfInterval,
   eachMonthOfInterval,
@@ -75,40 +69,89 @@ export default function Dashboard() {
   const [isComparisonMode, setIsComparisonMode] = useState(false);
   const [selectedTransaction, setSelectedTransaction] = useState<Transaction | null>(null);
 
-  useEffect(() => {
+  /**
+   * Fetches the latest 500 transactions for the current user, ordered
+   * by creation date descending. Called on mount and can be triggered
+   * manually via the refresh button.
+   */
+  const loadTransactions = useCallback(async () => {
     if (!user) {
       setLoading(false);
       return;
     }
 
     setLoading(true);
-    const q = query(
-      collection(db, "transactions"),
-      where("userId", "==", user.uid),
-      orderBy("createdAt", "desc"),
-      limit(500)
-    );
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const txs = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        created_at: doc.data().createdAt // Map for compatibility
-      })) as Transaction[];
-      setTransactions(txs);
-      setLoading(false);
-    }, (error) => {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("id, type, amount, category, description, created_at")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (error) {
       showToast("Failed to load transactions. Please check your connection.", "error");
-      handleFirestoreError(error, OperationType.LIST, "transactions");
+      console.error("Failed to fetch transactions:", error.message);
+    } else {
+      setTransactions((data as Transaction[]) ?? []);
+    }
+
+    setLoading(false);
+  }, [user, showToast]);
+
+  /**
+   * Initial fetch + real-time subscription.
+   *
+   * Supabase Realtime fires INSERT / UPDATE / DELETE events so the local
+   * state is kept in sync without polling:
+   *   INSERT  → prepend new row (maintains desc order)
+   *   UPDATE  → replace the matching row in-place
+   *   DELETE  → remove the matching row
+   *
+   * The channel is cleaned up when the component unmounts or the user changes.
+   */
+  useEffect(() => {
+    if (!user) {
       setLoading(false);
-    });
+      return;
+    }
 
-    return () => unsubscribe();
-  }, [user]);
+    loadTransactions();
 
-  const loadTransactions = () => {
-    // No-op as we use onSnapshot, but kept for compatibility with onSuccess callbacks
-  };
+    const channel = supabase
+      .channel(`transactions:user_id=eq.${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",                    // INSERT | UPDATE | DELETE
+          schema: "public",
+          table: "transactions",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            setTransactions((prev) => [payload.new as Transaction, ...prev]);
+          } else if (payload.eventType === "UPDATE") {
+            setTransactions((prev) =>
+              prev.map((t) =>
+                t.id === (payload.new as Transaction).id
+                  ? (payload.new as Transaction)
+                  : t
+              )
+            );
+          } else if (payload.eventType === "DELETE") {
+            setTransactions((prev) =>
+              prev.filter((t) => t.id !== (payload.old as { id: string }).id)
+            );
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user, loadTransactions]);
 
   const today = new Date();
   
@@ -332,10 +375,11 @@ export default function Dashboard() {
             <RefreshCw className={cn("w-5 h-5", loading && "animate-spin")} />
           </button>
           <div className="w-10 h-10 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-700 font-bold overflow-hidden">
-            {user?.photoURL ? (
-              <img src={user.photoURL} alt="Me" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+            {user?.user_metadata?.avatar_url ? (
+              <img src={user.user_metadata.avatar_url} alt="Me" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
             ) : (
-              user?.displayName?.slice(0, 2) || user?.email?.slice(0, 2) || 'Me'
+              // Supabase stores display name under user_metadata.full_name or user_metadata.name
+              (user?.user_metadata?.full_name ?? user?.user_metadata?.name ?? user?.email ?? 'Me').slice(0, 2)
             )}
           </div>
         </div>
@@ -444,88 +488,16 @@ export default function Dashboard() {
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis 
-                    dataKey="name" 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                  />
-                  <YAxis 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                    tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`}
-                  />
-                  <Tooltip 
-                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                  />
-                  <Legend 
-                    verticalAlign="top" 
-                    align="right" 
-                    iconType="circle" 
-                    wrapperStyle={{ fontSize: '10px', paddingBottom: '10px' }}
-                  />
-                  <Area 
-                    type="monotone" 
-                    dataKey="sales" 
-                    stroke="#10b981" 
-                    fillOpacity={1} 
-                    fill="url(#colorSales)" 
-                    strokeWidth={2}
-                    name={isComparisonMode ? "Current Sales" : "Sales"}
-                  />
-                  {isComparisonMode && (
-                    <Area 
-                      type="monotone" 
-                      dataKey="prevSales" 
-                      stroke="#94a3b8" 
-                      fillOpacity={0.05} 
-                      fill="#94a3b8" 
-                      strokeWidth={1}
-                      strokeDasharray="5 5"
-                      name="Previous Sales"
-                    />
-                  )}
-                  <Area 
-                    type="monotone" 
-                    dataKey="expenses" 
-                    stroke="#ef4444" 
-                    fillOpacity={1} 
-                    fill="url(#colorExpenses)" 
-                    strokeWidth={2}
-                    name={isComparisonMode ? "Current Expenses" : "Expenses"}
-                  />
-                  {isComparisonMode && (
-                    <Area 
-                      type="monotone" 
-                      dataKey="prevExpenses" 
-                      stroke="#fca5a5" 
-                      fillOpacity={0.05} 
-                      fill="#fca5a5" 
-                      strokeWidth={1}
-                      strokeDasharray="5 5"
-                      name="Previous Expenses"
-                    />
-                  )}
-                  <Line 
-                    type="monotone" 
-                    dataKey="profit" 
-                    stroke="#3b82f6" 
-                    strokeWidth={3} 
-                    dot={{ r: 4, fill: '#3b82f6' }}
-                    name={isComparisonMode ? "Current Profit" : "Profit/Loss"}
-                  />
-                  {isComparisonMode && (
-                    <Line 
-                      type="monotone" 
-                      dataKey="prevProfit" 
-                      stroke="#93c5fd" 
-                      strokeWidth={1} 
-                      strokeDasharray="3 3"
-                      dot={{ r: 2, fill: '#93c5fd' }}
-                      name="Previous Profit"
-                    />
-                  )}
+                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`} />
+                  <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }} />
+                  <Legend verticalAlign="top" align="right" iconType="circle" wrapperStyle={{ fontSize: '10px', paddingBottom: '10px' }} />
+                  <Area type="monotone" dataKey="sales" stroke="#10b981" fillOpacity={1} fill="url(#colorSales)" strokeWidth={2} name={isComparisonMode ? "Current Sales" : "Sales"} />
+                  {isComparisonMode && <Area type="monotone" dataKey="prevSales" stroke="#94a3b8" fillOpacity={0.05} fill="#94a3b8" strokeWidth={1} strokeDasharray="5 5" name="Previous Sales" />}
+                  <Area type="monotone" dataKey="expenses" stroke="#ef4444" fillOpacity={1} fill="url(#colorExpenses)" strokeWidth={2} name={isComparisonMode ? "Current Expenses" : "Expenses"} />
+                  {isComparisonMode && <Area type="monotone" dataKey="prevExpenses" stroke="#fca5a5" fillOpacity={0.05} fill="#fca5a5" strokeWidth={1} strokeDasharray="5 5" name="Previous Expenses" />}
+                  <Line type="monotone" dataKey="profit" stroke="#3b82f6" strokeWidth={3} dot={{ r: 4, fill: '#3b82f6' }} name={isComparisonMode ? "Current Profit" : "Profit/Loss"} />
+                  {isComparisonMode && <Line type="monotone" dataKey="prevProfit" stroke="#93c5fd" strokeWidth={1} strokeDasharray="3 3" dot={{ r: 2, fill: '#93c5fd' }} name="Previous Profit" />}
                   <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
                 </AreaChart>
               </ResponsiveContainer>
@@ -542,45 +514,15 @@ export default function Dashboard() {
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={chartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis 
-                    dataKey="name" 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                  />
-                  <YAxis 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                    tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`}
-                  />
-                  <Tooltip 
-                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                    cursor={{ fill: '#f8fafc' }}
-                  />
-                  <Bar 
-                    dataKey="profit" 
-                    name={isComparisonMode ? "Current Profit" : "Profit/Loss"}
-                    radius={[4, 4, 0, 0]}
-                    barSize={reportTimeframe === 'daily' ? 12 : 20}
-                  >
+                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`} />
+                  <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }} cursor={{ fill: '#f8fafc' }} />
+                  <Bar dataKey="profit" name={isComparisonMode ? "Current Profit" : "Profit/Loss"} radius={[4, 4, 0, 0]} barSize={reportTimeframe === 'daily' ? 12 : 20}>
                     {chartData.map((entry, index) => (
-                      <Cell 
-                        key={`cell-${index}`} 
-                        fill={entry.profit >= 0 ? '#10b981' : '#ef4444'} 
-                      />
+                      <Cell key={`cell-${index}`} fill={entry.profit >= 0 ? '#10b981' : '#ef4444'} />
                     ))}
                   </Bar>
-                  {isComparisonMode && (
-                    <Bar 
-                      dataKey="prevProfit" 
-                      name="Previous Profit"
-                      radius={[4, 4, 0, 0]}
-                      barSize={reportTimeframe === 'daily' ? 12 : 20}
-                      fill="#94a3b8"
-                      opacity={0.5}
-                    />
-                  )}
+                  {isComparisonMode && <Bar dataKey="prevProfit" name="Previous Profit" radius={[4, 4, 0, 0]} barSize={reportTimeframe === 'daily' ? 12 : 20} fill="#94a3b8" opacity={0.5} />}
                   <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
                 </BarChart>
               </ResponsiveContainer>
@@ -596,23 +538,12 @@ export default function Dashboard() {
             <div className="h-64 w-full flex flex-col items-center">
               <ResponsiveContainer width="100%" height="70%">
                 <PieChart>
-                  <Pie
-                    data={categoryData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={60}
-                    outerRadius={80}
-                    paddingAngle={5}
-                    dataKey="value"
-                  >
+                  <Pie data={categoryData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
                     {categoryData.map((entry, index) => (
                       <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                     ))}
                   </Pie>
-                  <Tooltip 
-                    formatter={(value: number) => `KES ${value.toLocaleString()}`}
-                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                  />
+                  <Tooltip formatter={(value: number) => `KES ${value.toLocaleString()}`} contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }} />
                 </PieChart>
               </ResponsiveContainer>
               <div className="grid grid-cols-2 gap-x-4 gap-y-2 w-full mt-4">
@@ -639,37 +570,11 @@ export default function Dashboard() {
               <ResponsiveContainer width="100%" height="100%">
                 <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis 
-                    dataKey="name" 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                  />
-                  <YAxis 
-                    yAxisId="left"
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                    tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`}
-                  />
-                  <YAxis 
-                    yAxisId="right"
-                    orientation="right"
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#3b82f6' }}
-                    tickFormatter={(value) => `${value}%`}
-                  />
-                  <Tooltip 
-                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                    cursor={{ fill: '#f8fafc' }}
-                  />
-                  <Legend 
-                    verticalAlign="top" 
-                    align="right" 
-                    iconType="circle" 
-                    wrapperStyle={{ fontSize: '10px', paddingBottom: '10px' }}
-                  />
+                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                  <YAxis yAxisId="left" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`} />
+                  <YAxis yAxisId="right" orientation="right" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#3b82f6' }} tickFormatter={(value) => `${value}%`} />
+                  <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }} cursor={{ fill: '#f8fafc' }} />
+                  <Legend verticalAlign="top" align="right" iconType="circle" wrapperStyle={{ fontSize: '10px', paddingBottom: '10px' }} />
                   <Bar yAxisId="left" dataKey="sales" fill="#10b981" name={isComparisonMode ? "Current Sales" : "Sales"} radius={[4, 4, 0, 0]} barSize={reportTimeframe === 'daily' ? 12 : 20} />
                   {isComparisonMode && <Bar yAxisId="left" dataKey="prevSales" fill="#94a3b8" name="Prev. Sales" radius={[4, 4, 0, 0]} barSize={reportTimeframe === 'daily' ? 12 : 20} opacity={0.5} />}
                   <Bar yAxisId="left" dataKey="expenses" fill="#ef4444" name={isComparisonMode ? "Current Expenses" : "Expenses"} radius={[4, 4, 0, 0]} barSize={reportTimeframe === 'daily' ? 12 : 20} />
@@ -684,17 +589,11 @@ export default function Dashboard() {
             <div className="flex justify-between items-start">
               <div>
                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Total Profit</p>
-                <h4 className={cn(
-                  "text-2xl font-bold",
-                  reportProfit >= 0 ? "text-emerald-600" : "text-red-600"
-                )}>
+                <h4 className={cn("text-2xl font-bold", reportProfit >= 0 ? "text-emerald-600" : "text-red-600")}>
                   KES {reportProfit.toLocaleString()}
                 </h4>
                 <div className="flex items-center gap-2 mt-1">
-                  <span className={cn(
-                    "text-[10px] font-bold px-1.5 py-0.5 rounded-full",
-                    reportProfit >= previousReportProfit ? "bg-emerald-100 text-emerald-600" : "bg-red-100 text-red-600"
-                  )}>
+                  <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded-full", reportProfit >= previousReportProfit ? "bg-emerald-100 text-emerald-600" : "bg-red-100 text-red-600")}>
                     {reportProfit >= previousReportProfit ? '+' : ''}
                     {previousReportProfit !== 0 ? ((reportProfit - previousReportProfit) / Math.abs(previousReportProfit) * 100).toFixed(0) : '100'}%
                   </span>
@@ -762,42 +661,11 @@ export default function Dashboard() {
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                  <XAxis 
-                    dataKey="name" 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                  />
-                  <YAxis 
-                    axisLine={false} 
-                    tickLine={false} 
-                    tick={{ fontSize: 10, fill: '#94a3b8' }}
-                    tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`}
-                  />
-                  <Tooltip 
-                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                  />
-                  <Area 
-                    type="monotone" 
-                    dataKey="cumulativeProfit" 
-                    stroke="#3b82f6" 
-                    fillOpacity={1} 
-                    fill="url(#colorCumulative)" 
-                    strokeWidth={2}
-                    name={isComparisonMode ? "Current Cumulative" : "Cumulative Profit"}
-                  />
-                  {isComparisonMode && (
-                    <Area 
-                      type="monotone" 
-                      dataKey="prevCumulativeProfit" 
-                      stroke="#94a3b8" 
-                      fillOpacity={0.1} 
-                      fill="#94a3b8" 
-                      strokeWidth={1}
-                      strokeDasharray="5 5"
-                      name="Previous Cumulative"
-                    />
-                  )}
+                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} tickFormatter={(value) => `K${value >= 1000 ? (value/1000).toFixed(0) + 'k' : value}`} />
+                  <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }} />
+                  <Area type="monotone" dataKey="cumulativeProfit" stroke="#3b82f6" fillOpacity={1} fill="url(#colorCumulative)" strokeWidth={2} name={isComparisonMode ? "Current Cumulative" : "Cumulative Profit"} />
+                  {isComparisonMode && <Area type="monotone" dataKey="prevCumulativeProfit" stroke="#94a3b8" fillOpacity={0.1} fill="#94a3b8" strokeWidth={1} strokeDasharray="5 5" name="Previous Cumulative" />}
                   <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
                 </AreaChart>
               </ResponsiveContainer>
@@ -847,10 +715,7 @@ export default function Dashboard() {
                       <p className="text-xs text-slate-500 capitalize">{t.category} • {format(new Date(t.created_at), 'h:mm a')}</p>
                     </div>
                   </div>
-                  <p className={cn(
-                    "font-bold",
-                    t.type === 'sale' ? "text-emerald-600" : "text-slate-900"
-                  )}>
+                  <p className={cn("font-bold", t.type === 'sale' ? "text-emerald-600" : "text-slate-900")}>
                     {t.type === 'sale' ? '+' : '-'} {t.amount.toLocaleString()}
                   </p>
                 </motion.button>
