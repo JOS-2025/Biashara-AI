@@ -1,12 +1,5 @@
 import { useState, useEffect } from "react";
-import { 
-  collection, 
-  addDoc, 
-  updateDoc, 
-  doc, 
-  serverTimestamp 
-} from "firebase/firestore";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
+import { supabase } from "../lib/supabase";
 import { useAuth } from "../hooks/useAuth";
 import { X, Package, Save, AlertCircle } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
@@ -17,11 +10,11 @@ interface Product {
   name: string;
   category: string;
   stock: number;
-  totalSold: number;
-  totalBought: number;
+  total_sold: number;
+  total_bought: number;
   unit: string;
-  userId: string;
-  createdAt: any;
+  user_id: string;
+  created_at: string;
 }
 
 interface ProductModalProps {
@@ -71,36 +64,58 @@ export default function ProductModal({ isOpen, onClose, product }: ProductModalP
     setLoading(true);
     try {
       if (product) {
-        // Update existing product
-        await updateDoc(doc(db, "products", product.id), {
-          name: formData.name.trim(),
-          category: formData.category.trim(),
-          stock: Number(formData.stock),
-          unit: formData.unit.trim(),
-          updatedAt: new Date().toISOString()
-        });
+        // Update existing product — only editable fields; totals are
+        // managed by transactions and should not be overwritten here.
+        const { error } = await supabase
+          .from("products")
+          .update({
+            name: formData.name.trim(),
+            category: formData.category.trim(),
+            stock: Number(formData.stock),
+            unit: formData.unit.trim(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", product.id)
+          .eq("user_id", user.id); // RLS guard: only owner can update
+
+        if (error) throw error;
         showToast("Product updated successfully", "success");
       } else {
-        // Add new product
-        await addDoc(collection(db, "products"), {
-          name: formData.name.trim(),
-          category: formData.category.trim(),
-          stock: Number(formData.stock),
-          totalSold: 0,
-          totalBought: Number(formData.stock), // Initial stock is considered bought
-          unit: formData.unit.trim(),
-          userId: user.uid,
-          createdAt: serverTimestamp(),
-        });
+        // Insert new product.
+        // created_at is set explicitly so it matches the DB column name.
+        // total_bought is seeded with the initial stock value to reflect
+        // the opening inventory as an implicit purchase — same logic as
+        // the original Firebase version.
+        const { error } = await supabase
+          .from("products")
+          .insert({
+            name: formData.name.trim(),
+            category: formData.category.trim(),
+            stock: Number(formData.stock),
+            total_sold: 0,
+            total_bought: Number(formData.stock),
+            unit: formData.unit.trim(),
+            user_id: user.id,
+            created_at: new Date().toISOString(),
+          });
+
+        if (error) throw error;
         showToast("Product added successfully", "success");
       }
       onClose();
     } catch (error: any) {
       console.error("Error saving product:", error);
-      if (error.message && error.message.includes('permission')) {
-        handleFirestoreError(error, OperationType.WRITE, "products");
-      }
-      showToast("Failed to save product", "error");
+      const isPermissionError =
+        error?.code === "42501" ||            // Postgres RLS violation code
+        error?.message?.includes("permission") ||
+        error?.message?.includes("denied");
+
+      showToast(
+        isPermissionError
+          ? "Permission denied. Please check your login status."
+          : "Failed to save product",
+        "error"
+      );
     } finally {
       setLoading(false);
     }
@@ -118,7 +133,7 @@ export default function ProductModal({ isOpen, onClose, product }: ProductModalP
           onClick={onClose}
           className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
         />
-        
+
         <motion.div
           initial={{ y: "100%" }}
           animate={{ y: 0 }}
@@ -135,7 +150,7 @@ export default function ProductModal({ isOpen, onClose, product }: ProductModalP
                 {product ? "Edit Product" : "New Product"}
               </h2>
             </div>
-            <button 
+            <button
               onClick={onClose}
               className="p-2 hover:bg-slate-100 rounded-full transition-colors"
             >
@@ -188,7 +203,9 @@ export default function ProductModal({ isOpen, onClose, product }: ProductModalP
                     required
                     min="0"
                     value={formData.stock}
-                    onChange={(e) => setFormData({ ...formData, stock: Number(e.target.value) })}
+                    onChange={(e) =>
+                      setFormData({ ...formData, stock: Number(e.target.value) })
+                    }
                     className="w-full px-4 py-3 bg-slate-50 border-2 border-transparent rounded-2xl focus:border-emerald-500 focus:bg-white transition-all outline-none"
                   />
                 </div>
@@ -211,7 +228,7 @@ export default function ProductModal({ isOpen, onClose, product }: ProductModalP
                 <div className="bg-amber-50 p-4 rounded-2xl border border-amber-100 flex gap-3">
                   <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
                   <p className="text-xs text-amber-800 leading-relaxed">
-                    Editing initial stock directly will overwrite current stock. 
+                    Editing initial stock directly will overwrite current stock.
                     For regular inventory updates, use the "Add Transaction" feature.
                   </p>
                 </div>
