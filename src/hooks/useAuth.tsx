@@ -1,6 +1,6 @@
 import { useState, useEffect, createContext, useContext } from 'react';
-import { auth } from '../lib/firebase';
-import { onAuthStateChanged, User } from 'firebase/auth';
+import { type User } from '@supabase/supabase-js';
+import { supabase } from '../lib/supabase';
 
 interface AuthContextType {
   user: User | null;
@@ -14,15 +14,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setUser(user);
-      setLoading(false);
-      if (user) {
-        localStorage.setItem('biashara_user', user.uid);
+    // 1. Hydrate immediately from the cached session so the UI never flickers
+    //    on page load — mirrors Firebase's synchronous initial emission from
+    //    onAuthStateChanged.
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      const sessionUser = session?.user ?? null;
+      setUser(sessionUser);
+      if (sessionUser) {
+        localStorage.setItem('biashara_user', sessionUser.id);
+      } else {
+        localStorage.removeItem('biashara_user');
       }
+      setLoading(false);
     });
 
-    return () => unsubscribe();
+    // 2. Subscribe to all subsequent auth events (SIGNED_IN, SIGNED_OUT,
+    //    TOKEN_REFRESHED, USER_UPDATED, etc.) — equivalent to Firebase's
+    //    onAuthStateChanged listener.
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      const sessionUser = session?.user ?? null;
+      setUser(sessionUser);
+      if (sessionUser) {
+        localStorage.setItem('biashara_user', sessionUser.id);
+      } else {
+        localStorage.removeItem('biashara_user');
+      }
+      // loading is already false after getSession resolves, but guard
+      // here in case the auth event fires before getSession returns.
+      setLoading(false);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
   return (
